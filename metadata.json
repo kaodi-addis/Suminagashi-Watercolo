@@ -1,0 +1,6 @@
+{
+  "name": "Suminagashi Watercolor",
+  "description": "An interactive, premium Japanese watercolor WebGL experience reflecting traditional Suminagashi ink and paper aesthetics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
