@@ -42,6 +42,13 @@ uniform vec2 u_mouse_pos;
 uniform vec2 u_mouse_dir;
 uniform float u_mouse_speed;
 
+// Dynamic simulation and ink-well parameters mapping from customizable React state
+uniform float u_sim_resolution;
+uniform float u_density;
+uniform float u_dissipation;
+uniform float u_velocity;
+uniform float u_curl;
+
 in vec2 v_uv;
 out vec4 fragColor;
 
@@ -72,21 +79,21 @@ void main() {
   
   // 1. Water flow/turbulence
   // Create an organic fluid drift (faint gravity and natural swirling currents)
-  float flowSpeed = 0.0003;
-  vec2 noiseCoord = uv * 3.8 + vec2(u_time * 0.05);
+  float flowSpeed = 0.0003 * (u_velocity / 40.0);
+  vec2 noiseCoord = uv * (u_curl * 0.35) + vec2(u_time * 0.05);
   float n1 = noise2d(noiseCoord);
   float n2 = noise2d(noiseCoord + vec2(43.7, 88.1));
   vec2 turbulence = vec2(sin(n1 * 6.28318 + u_time * 0.1), cos(n2 * 6.28318 - u_time * 0.08)) * flowSpeed;
   
   // Add slow, downward water-soaking gravity drift
-  vec2 gravityDrift = vec2(0.0, -0.00004);
+  vec2 gravityDrift = vec2(0.0, -0.00004 * (u_velocity / 40.0));
   
   // Add interactive mouse water current ripples
   float mDist = distance(uv, u_mouse_pos);
   if (mDist < 0.20 && u_mouse_speed > 0.0005) {
     float strength = smoothstep(0.20, 0.008, mDist);
     // Push the liquid along mouse trajectory coordinates
-    vec2 pushForce = u_mouse_dir * strength * u_mouse_speed * 1.8;
+    vec2 pushForce = u_mouse_dir * strength * u_mouse_speed * 1.8 * (u_velocity / 40.0);
     turbulence += pushForce;
   }
   
@@ -98,7 +105,7 @@ void main() {
   
   // 2. Watercolor Ink Diffusion
   // Calculate Laplacian coordinates using a 4-tap box filter
-  vec2 eps = vec2(1.0 / 1024.0); // Fluid sim buffer resolution is fixed at 1024x1024
+  vec2 eps = vec2(1.0 / u_sim_resolution);
   vec4 neighbors = (
     texture(u_prev_tex, clamp(advected_uv + vec2(1.0, 0.0) * eps, 0.0, 1.0)) +
     texture(u_prev_tex, clamp(advected_uv + vec2(-1.0, 0.0) * eps, 0.0, 1.0)) +
@@ -121,13 +128,15 @@ void main() {
     float dryBlend = mix(1.0, paperSkipRandom, u_brush_dryness);
     
     // Accumulate sum of pigment density
-    vec4 addedInk = u_brush_color * brushIntensity * u_brush_pressure * dryBlend * 1.6;
+    vec4 addedInk = u_brush_color * brushIntensity * u_brush_pressure * dryBlend * 1.6 * (u_density / 30.0);
     next_state = clamp(next_state + addedInk, 0.0, 2.0);
   }
   
-  // Washing wash effect (fading previous layers)
+  // Washing wash effect (fading previous layers) or steady chemical paper dissipation/decay
   if (u_clear_fade > 0.0) {
     next_state *= (1.0 - u_clear_fade);
+  } else if (u_dissipation > 0.0) {
+    next_state *= (1.0 - (u_dissipation / 5000.0));
   }
   
   fragColor = clamp(next_state, 0.0, 2.0);
@@ -141,6 +150,7 @@ uniform sampler2D u_sim_tex;
 uniform float u_time;
 uniform vec2 u_res;
 uniform float u_dark_mode; // Lerps between 0 (Paper) and 1 (Dark Gallery)
+uniform float u_dye_resolution; // Customize resolution size slider
 
 in vec2 v_uv;
 out vec4 fragColor;
@@ -161,7 +171,7 @@ float noise2d(vec2 p) {
 
 // Procedural Washi Paper Raw Fibers
 float get_fiber(vec2 uv) {
-  vec2 p = uv * 320.0;
+  vec2 p = uv * 320.0 * (u_dye_resolution / 1024.0);
   float n1 = noise2d(p);
   float n2 = noise2d(p * 2.0 + vec2(15.2, 37.4));
   
@@ -338,6 +348,30 @@ export default function App() {
   const [canvasCleared, setCanvasCleared] = useState<boolean>(false);
   const [customStrokeColor, setCustomStrokeColor] = useState<string>(''); // For informational logs
 
+  // Simulation customize parameters mapping directly to user requests
+  const [simResolution, setSimResolution] = useState<number>(384);
+  const [dyeResolution, setDyeResolution] = useState<number>(1024);
+  const [density, setDensity] = useState<number>(30);
+  const [dissipation, setDissipation] = useState<number>(35);
+  const [velocity, setVelocity] = useState<number>(40);
+  const [pressureIters, setPressureIters] = useState<number>(20); // matching image
+  const [curl, setCurl] = useState<number>(11);
+  const [bloom, setBloom] = useState<number>(10);
+  const [autoInk, setAutoInk] = useState<number>(0);
+  const [showSettings, setShowSettings] = useState<boolean>(true); // default open
+
+  // Floating splashes queue for staggered fluid droplets effect
+  const splashDropsQueueRef = useRef<{ 
+    x: number; 
+    y: number; 
+    devX: number; 
+    devY: number; 
+    color: number[]; 
+    rad: number; 
+    pressure: number; 
+    delay: number; 
+  }[]>([]);
+
   // Coordinates and variables for WebGL interaction
   const mouseStateRef = useRef({
     x: 0.5,
@@ -445,10 +479,9 @@ export default function App() {
     }
 
     // 2. Initialize simulation grid double-buffer (Ping Pong)
-    // We run the fluid simulation on a fixed 1024x1024 square to preserve
-    // identical physics and ink diffusion rate across resize events.
-    const simW = 1024;
-    const simH = 1024;
+    // We run the fluid simulation on a customizable buffer resolution
+    const simW = simResolution;
+    const simH = simResolution;
     const buffers: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
 
     for (let i = 0; i < 2; i++) {
@@ -522,8 +555,22 @@ export default function App() {
       if (renderReqRef.current) {
         cancelAnimationFrame(renderReqRef.current);
       }
+      
+      // Clean up buffers and textures to prevent leaks upon recreation
+      const glCtx = glRef.current;
+      if (glCtx) {
+        if (buffers.length > 0) {
+          buffers.forEach(b => {
+            glCtx.deleteTexture(b.texture);
+            glCtx.deleteFramebuffer(b.framebuffer);
+          });
+        }
+        if (positionBufferRef.current) {
+          glCtx.deleteBuffer(positionBufferRef.current);
+        }
+      }
     };
-  }, []);
+  }, [simResolution]);
 
   // ==========================================
   // RENDER & PHYSICS LOOP
@@ -534,8 +581,6 @@ export default function App() {
     if (!gl || !simBuffersRef.current) return;
 
     const canvas = canvasRef.current!;
-    const simW = 1024;
-    const simY = 1024;
 
     const render = () => {
       frameCounterRef.current += 1;
@@ -586,7 +631,7 @@ export default function App() {
           brushPrevPos = [autoStrokeRef.current.prevX, autoStrokeRef.current.prevY];
           
           // Splat-to-hair calligraphy variance
-          brushRad = brushWeight * (1.1 * Math.sin(t * Math.PI) + 0.5);
+          brushRad = brushWeight * (1.1 * Math.sin(t * Math.PI) + 0.5) * (bloom / 10.0);
           brushPressure = 0.9 * Math.sin(t * Math.PI) + 0.15;
           brushDryness = t > 0.72 ? (t - 0.72) * 3.5 : 0.0; // skips on dry paper edge
 
@@ -613,7 +658,7 @@ export default function App() {
 
           brushPos = [autoStrokeRef.current.x, autoStrokeRef.current.y];
           brushPrevPos = [autoStrokeRef.current.prevX, autoStrokeRef.current.prevY];
-          brushRad = brushWeight * 0.55 * (0.8 * Math.sin(t * Math.PI) + 0.3);
+          brushRad = brushWeight * 0.55 * (0.8 * Math.sin(t * Math.PI) + 0.3) * (bloom / 10.0);
           brushPressure = 0.6;
           brushDryness = t > 0.85 ? 0.45 : 0.0;
 
@@ -626,7 +671,7 @@ export default function App() {
         if (mouseStateRef.current.isDown) {
           brushPos = [mouseStateRef.current.x, mouseStateRef.current.y];
           brushPrevPos = [mouseStateRef.current.prevX, mouseStateRef.current.prevY];
-          brushRad = brushWeight;
+          brushRad = brushWeight * (bloom / 10.0);
           brushPressure = 1.0;
           
           // Inject correct active well colors
@@ -650,7 +695,7 @@ export default function App() {
 
           brushPos = [px, py];
           brushPrevPos = [px + 0.002, py - 0.002];
-          brushRad = brushWeight * (2.0 + 1.2 * Math.sin(count * 0.12)); // larger wet blooms
+          brushRad = brushWeight * (2.0 + 1.2 * Math.sin(count * 0.12)) * (bloom / 10.0); // larger wet blooms
           brushPressure = 0.08; // extremely faint dilution to morph artwork color
           brushDryness = 0.0; // fully watery saturation
           
@@ -659,72 +704,122 @@ export default function App() {
         }
       }
 
+      // Staggered Splashes logic triggered by user action
+      if (splashDropsQueueRef.current.length > 0) {
+        // Find if we have drops with delay <= 0
+        const readyToDraw = splashDropsQueueRef.current.filter(d => d.delay <= 0);
+        
+        // Decrement delay for the rest
+        splashDropsQueueRef.current = splashDropsQueueRef.current.map(d => ({
+          ...d,
+          delay: d.delay - 1
+        }));
+        
+        if (readyToDraw.length > 0) {
+          const drop = readyToDraw[0];
+          brushPos = [drop.x, drop.y];
+          brushPrevPos = [drop.devX, drop.devY];
+          brushRad = drop.rad;
+          brushPressure = drop.pressure;
+          brushDryness = 0.0;
+          brushColor = drop.color;
+          
+          // Remove from queue
+          splashDropsQueueRef.current = splashDropsQueueRef.current.filter(d => d !== drop);
+        }
+      }
+
+      // Auto Ink dripping logic (if slider is > 0)
+      const autoInkThreshold = autoInk > 0 ? Math.max(10, Math.floor(150 / autoInk)) : 999999;
+      if (autoInk > 0 && count % autoInkThreshold === 0) {
+        const rx = 0.15 + Math.random() * 0.7;
+        const ry = 0.15 + Math.random() * 0.7;
+        brushPos = [rx, ry];
+        brushPrevPos = [rx + 0.001, ry - 0.001];
+        brushRad = brushWeight * (1.5 + Math.random() * 1.5) * (bloom / 10.0);
+        brushPressure = 0.4 + Math.random() * 0.6;
+        brushDryness = 0.0;
+        brushColor = INK_WELLS[Math.floor(Math.random() * INK_WELLS.length)].weightColor;
+      }
+
       // ==========================================
-      // PASS 1: FLUID SIMULATION (Render to Framebuffer)
+      // PASS 1: FLUID SIMULATION (Multi-Step passes)
       // ==========================================
       const buffers = simBuffersRef.current!;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, buffers.write.framebuffer);
-      gl.viewport(0, 0, simW, simY);
+      const passes = Math.max(1, pressureIters);
 
       gl.useProgram(simProgramRef.current!);
 
-      // Set simulation variables
-      gl.uniform1i(gl.getUniformLocation(simProgramRef.current!, 'u_prev_tex'), 0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, buffers.read.texture);
+      // Set simulation variables once
+      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_sim_resolution'), simResolution);
+      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_density'), density);
+      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_dissipation'), dissipation);
+      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_velocity'), velocity);
+      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_curl'), curl);
 
-      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_time'), count * 0.016);
-      
-      // Brush coordinates
-      gl.uniform2f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_pos'), brushPos[0], brushPos[1]);
-      gl.uniform2f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_prev_pos'), brushPrevPos[0], brushPrevPos[1]);
-      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_radius'), brushRad);
-      gl.uniform4f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_color'), brushColor[0], brushColor[1], brushColor[2], brushColor[3]);
-      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_pressure'), brushPressure);
-      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_brush_dryness'), brushDryness);
+      const uBrushPosLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_pos');
+      const uBrushPrevPosLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_prev_pos');
+      const uBrushRadiusLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_radius');
+      const uBrushColorLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_color');
+      const uBrushPressureLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_pressure');
+      const uBrushDrynessLoc = gl.getUniformLocation(simProgramRef.current!, 'u_brush_dryness');
+      const uClearFadeLoc = gl.getUniformLocation(simProgramRef.current!, 'u_clear_fade');
+      const uDiffusionRatesLoc = gl.getUniformLocation(simProgramRef.current!, 'u_diffusion_rates');
+      const uMousePosLoc = gl.getUniformLocation(simProgramRef.current!, 'u_mouse_pos');
+      const uMouseDirLoc = gl.getUniformLocation(simProgramRef.current!, 'u_mouse_dir');
+      const uMouseSpeedLoc = gl.getUniformLocation(simProgramRef.current!, 'u_mouse_speed');
+      const uTimeLoc = gl.getUniformLocation(simProgramRef.current!, 'u_time');
 
-      // Decaying wash properties
-      gl.uniform1f(gl.getUniformLocation(simProgramRef.current!, 'u_clear_fade'), canvasCleared ? 0.99 : (clearFadeRegisterRef.current > 0.0 ? clearFadeRegisterRef.current : 0.0));
-      
-      // Active ink water diffusion settings
-      const currentInk = INK_WELLS[selectedColorIdx];
-      gl.uniform4f(
-        gl.getUniformLocation(simProgramRef.current!, 'u_diffusion_rates'),
-        currentInk.diffusion[0],
-        currentInk.diffusion[1],
-        currentInk.diffusion[2],
-        currentInk.diffusion[3]
-      );
+      for (let p = 0; p < passes; p++) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, buffers.write.framebuffer);
+        gl.viewport(0, 0, simResolution, simResolution);
 
-      // Mouse water displacements currents
-      gl.uniform2f(
-        gl.getUniformLocation(simProgramRef.current!, 'u_mouse_pos'),
-        mouseStateRef.current.x,
-        mouseStateRef.current.y
-      );
-      gl.uniform2f(
-        gl.getUniformLocation(simProgramRef.current!, 'u_mouse_dir'),
-        mouseStateRef.current.dirX,
-        mouseStateRef.current.dirY
-      );
-      gl.uniform1f(
-        gl.getUniformLocation(simProgramRef.current!, 'u_mouse_speed'),
-        mouseStateRef.current.speed
-      );
+        gl.uniform1i(gl.getUniformLocation(simProgramRef.current!, 'u_prev_tex'), 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, buffers.read.texture);
 
-      // Set position attribute bindings
-      const posAttrSim = gl.getAttribLocation(simProgramRef.current!, 'a_position');
-      gl.enableVertexAttribArray(posAttrSim);
-      gl.bindBuffer(gl.ARRAY_BUFFER, positionBufferRef.current);
-      gl.vertexAttribPointer(posAttrSim, 2, gl.FLOAT, false, 0, 0);
+        // Advance simulation time slightly per pass
+        gl.uniform1f(uTimeLoc, (count + p * 0.1) * 0.016);
 
-      // Render fullscreen simulation step
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+        // Standard inputs are injected in the first pass (p === 0)
+        if (p === 0) {
+          gl.uniform2f(uBrushPosLoc, brushPos[0], brushPos[1]);
+          gl.uniform2f(uBrushPrevPosLoc, brushPrevPos[0], brushPrevPos[1]);
+          gl.uniform1f(uBrushRadiusLoc, brushRad);
+          gl.uniform4f(uBrushColorLoc, brushColor[0], brushColor[1], brushColor[2], brushColor[3]);
+          gl.uniform1f(uBrushPressureLoc, brushPressure);
+          gl.uniform1f(uBrushDrynessLoc, brushDryness);
+          gl.uniform1f(uClearFadeLoc, canvasCleared ? 0.99 : (clearFadeRegisterRef.current > 0.0 ? clearFadeRegisterRef.current : 0.0));
 
-      // Swap buffers to propagate textures
-      buffers.swap();
+          const currentInk = INK_WELLS[selectedColorIdx];
+          gl.uniform4f(
+            uDiffusionRatesLoc,
+            currentInk.diffusion[0],
+            currentInk.diffusion[1],
+            currentInk.diffusion[2],
+            currentInk.diffusion[3]
+          );
 
-      // Reset cleared state indicator
+          gl.uniform2f(uMousePosLoc, mouseStateRef.current.x, mouseStateRef.current.y);
+          gl.uniform2f(uMouseDirLoc, mouseStateRef.current.dirX, mouseStateRef.current.dirY);
+          gl.uniform1f(uMouseSpeedLoc, mouseStateRef.current.speed);
+        } else {
+          // Zero-out brush ink injections and mouse currents on subsequent advection-diffusion cycles
+          gl.uniform1f(uBrushRadiusLoc, 0.0);
+          gl.uniform1f(uBrushPressureLoc, 0.0);
+          gl.uniform1f(uClearFadeLoc, 0.0);
+          gl.uniform1f(uMouseSpeedLoc, 0.0);
+        }
+
+        const posAttrSim = gl.getAttribLocation(simProgramRef.current!, 'a_position');
+        gl.enableVertexAttribArray(posAttrSim);
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBufferRef.current);
+        gl.vertexAttribPointer(posAttrSim, 2, gl.FLOAT, false, 0, 0);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        buffers.swap();
+      }
+
       if (canvasCleared) {
         setCanvasCleared(false);
       }
@@ -745,6 +840,7 @@ export default function App() {
       gl.uniform1f(gl.getUniformLocation(presProgramRef.current!, 'u_time'), count * 0.016);
       gl.uniform2f(gl.getUniformLocation(presProgramRef.current!, 'u_res'), canvas.width, canvas.height);
       gl.uniform1f(gl.getUniformLocation(presProgramRef.current!, 'u_dark_mode'), currentDarkModeRef.current);
+      gl.uniform1f(gl.getUniformLocation(presProgramRef.current!, 'u_dye_resolution'), dyeResolution);
 
       // Position attribute binding
       const posAttrPres = gl.getAttribLocation(presProgramRef.current!, 'a_position');
@@ -770,7 +866,22 @@ export default function App() {
         cancelAnimationFrame(renderReqRef.current);
       }
     };
-  }, [selectedColorIdx, themeMode, isMeditationFlow, brushWeight, canvasCleared]);
+  }, [
+    selectedColorIdx, 
+    themeMode, 
+    isMeditationFlow, 
+    brushWeight, 
+    canvasCleared, 
+    simResolution,
+    dyeResolution,
+    density,
+    dissipation,
+    velocity,
+    pressureIters,
+    curl,
+    bloom,
+    autoInk
+  ]);
 
   // ==========================================
   // MOUSE & TOUCH INTERACTIVE BINDINGS
@@ -942,39 +1053,54 @@ export default function App() {
         </div>
 
         {/* 
-          TOP RIGHT: PREMIUM SLIDING MODE SWITCH
-          "Paper Mode" vs "Dark Gallery" using Sophisticated Dark design color schemes
+          TOP RIGHT: PREMIUM SLIDING MODE SWITCH WITH INTEGRATED CUSTOMIZATION GEAR
+          "Paper Mode" vs "Dark Gallery" + Customize Gear
         */}
         <div 
           id="gallery-theme-switch"
-          className={`absolute top-6 right-6 md:top-12 md:right-12 flex gap-1 p-1 rounded-full backdrop-blur-md transition-all duration-1000 border ${
+          className="absolute top-6 right-6 md:top-12 md:right-12 flex items-center gap-2 z-10"
+        >
+          <div className={`flex gap-1 p-1 rounded-full backdrop-blur-md transition-all duration-1000 border ${
             themeMode === 'paper' 
               ? 'bg-[#1a1c1a]/5 border-black/5' 
               : 'bg-black/40 border-white/10'
-          }`}
-        >
+          }`}>
+            <button
+              id="switch-paper-mode"
+              onClick={() => setThemeMode('paper')}
+              className={`px-5 py-2 text-[9px] md:text-[10px] font-bold tracking-widest uppercase rounded-full transition-all duration-500 cursor-pointer ${
+                themeMode === 'paper' 
+                  ? 'bg-white text-[#1d1c22] shadow-sm' 
+                  : 'text-[#849a8d] hover:text-[#eae3d5]'
+              }`}
+            >
+              Paper Mode
+            </button>
+            
+            <button
+              id="switch-gallery-mode"
+              onClick={() => setThemeMode('gallery')}
+              className={`px-5 py-2 text-[9px] md:text-[10px] font-bold tracking-widest uppercase rounded-full transition-all duration-500 cursor-pointer ${
+                themeMode === 'gallery' 
+                  ? 'bg-[#152e20] text-[#cfebd9] border border-[#3e6850]/40 shadow-sm' 
+                  : 'text-[#849a8d] hover:text-[#eae3d5]'
+              }`}
+            >
+              Dark Gallery
+            </button>
+          </div>
+
           <button
-            id="switch-paper-mode"
-            onClick={() => setThemeMode('paper')}
-            className={`px-5 py-2 text-[9px] md:text-[10px] font-bold tracking-widest uppercase rounded-full transition-all duration-500 cursor-pointer ${
-              themeMode === 'paper' 
-                ? 'bg-white text-[#1d1c22] shadow-sm' 
-                : 'text-[#849a8d] hover:text-[#eae3d5]'
+            id="toggle-customization-settings"
+            onClick={() => setShowSettings(!showSettings)}
+            className={`p-2.5 rounded-full cursor-pointer transition-all duration-500 backdrop-blur-md border flex items-center justify-center shadow-lg ${
+              showSettings
+                ? 'bg-[#152e20] text-[#cfebd9] border-[#3e6850]/50'
+                : (themeMode === 'paper' ? 'bg-white/40 border-black/5 text-[#1a1c1a]/70 hover:bg-white/80 scale-100' : 'bg-black/30 border-white/10 text-[#849a8d] hover:text-white')
             }`}
+            title="Customization Physics Settings"
           >
-            Paper Mode
-          </button>
-          
-          <button
-            id="switch-gallery-mode"
-            onClick={() => setThemeMode('gallery')}
-            className={`px-5 py-2 text-[9px] md:text-[10px] font-bold tracking-widest uppercase rounded-full transition-all duration-500 cursor-pointer ${
-              themeMode === 'gallery' 
-                ? 'bg-[#152e20] text-[#cfebd9] border border-[#3e6850]/40 shadow-sm' 
-                : 'text-[#849a8d] hover:text-[#eae3d5]'
-            }`}
-          >
-            Dark Gallery
+            <Settings size={14} className={showSettings ? "animate-spin" : ""} />
           </button>
         </div>
 
@@ -1143,10 +1269,264 @@ export default function App() {
           })}
         </div>
 
-        {/* 
-          MOBILE CONTROL TRIGGER BUTTONS 
-          Visible on smartphones instead of the rich hover boxes
-        */}
+        {/* COMPACT PREMIUM CUSTOMIZATION SIDEBAR */}
+        {showSettings && (
+          <div
+            id="simulation-customizer-panel"
+            className={`absolute left-4 top-[210px] md:top-28 bottom-[135px] w-[290px] max-w-[85vw] flex flex-col rounded-3xl backdrop-blur-xl border p-4 transition-all duration-700 ease-out shadow-2xl z-20 overflow-y-auto ${
+              themeMode === 'paper'
+                ? 'bg-white/80 border-black/5 text-neutral-900 shadow-neutral-300/40'
+                : 'bg-[#060c08]/92 border-emerald-950/40 text-[#eae3d5] shadow-black/80'
+            }`}
+          >
+            <div className="flex items-center justify-between border-b pb-1.5 mb-3 border-[#5f8f73]/15">
+              <span className="font-serif font-bold text-[10px] tracking-widest uppercase text-[#5f8f73] flex items-center gap-1.5">
+                <Settings size={11} className="text-emerald-500 animate-[spin_5s_linear_infinite]" />
+                <span>Sim Physics Controls</span>
+              </span>
+              <button
+                id="close-customizer"
+                onClick={() => setShowSettings(false)}
+                className="text-[9px] tracking-widest hover:text-[#5f8f73] uppercase cursor-pointer opacity-70"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Sim Parameters Scroll Body */}
+            <div className="flex flex-col gap-3 font-sans pr-1 select-none text-[10px]">
+              
+              {/* Parameter 1: Simulation Grid Resolution */}
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">1. Grid Resolution</span>
+                  <span className="font-mono bg-emerald-500/10 px-1 py-0.5 rounded text-emerald-400 font-bold text-[9px]">
+                    {simResolution}² px
+                  </span>
+                </div>
+                <p className="text-[8.5px] text-[#849a8d] leading-normal font-light">
+                  Size of math grid. Lower is faster, higher resolution is extremely dense.
+                </p>
+                <div className="grid grid-cols-5 gap-1 mt-0.5">
+                  {[256, 384, 512, 704, 1024].map((res) => (
+                    <button
+                      key={res}
+                      onClick={() => setSimResolution(res)}
+                      className={`py-0.5 text-[8px] font-mono rounded font-bold cursor-pointer transition-all ${
+                        simResolution === res
+                          ? 'bg-emerald-800 text-white'
+                          : 'bg-black/10 text-[#849a8d] hover:bg-black/25'
+                      }`}
+                    >
+                      {res}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Parameter 2: Dye Fiber Scale (Dye Resolution) */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">2. Mulberry Fiber Scale</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{dyeResolution} px</span>
+                </div>
+                <input
+                  id="input-dye-res"
+                  type="range"
+                  min="256"
+                  max="2048"
+                  step="64"
+                  value={dyeResolution}
+                  onChange={(e) => setDyeResolution(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 3: Ink Density */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">3. Ink Density (Concentration)</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{density}%</span>
+                </div>
+                <input
+                  id="input-density-slider"
+                  type="range"
+                  min="10"
+                  max="100"
+                  step="5"
+                  value={density}
+                  onChange={(e) => setDensity(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 4: Dissipation */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">4. Capillary Dissipation</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{dissipation}%</span>
+                </div>
+                <input
+                  id="input-dissipation-slider"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={dissipation}
+                  onChange={(e) => setDissipation(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 5: Water Velocity */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">5. Water Current Speed</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{velocity}%</span>
+                </div>
+                <input
+                  id="input-velocity-slider"
+                  type="range"
+                  min="5"
+                  max="120"
+                  step="5"
+                  value={velocity}
+                  onChange={(e) => setVelocity(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 6: Solver Steps Passes */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">6. Solver Step Passes (Iters)</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{pressureIters} steps</span>
+                </div>
+                <input
+                  id="input-iters-slider"
+                  type="range"
+                  min="1"
+                  max="40"
+                  step="1"
+                  value={pressureIters}
+                  onChange={(e) => setPressureIters(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 7: Swirl Grid Curl */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">7. Swirl Grid Curl (Turbulence)</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{curl} size</span>
+                </div>
+                <input
+                  id="input-curl-slider"
+                  type="range"
+                  min="2"
+                  max="32"
+                  step="1"
+                  value={curl}
+                  onChange={(e) => setCurl(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 8: Wet Ink Bloom Spread */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">8. Wet Ink Bloom (Spread)</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{bloom / 10}x</span>
+                </div>
+                <input
+                  id="input-bloom-slider"
+                  type="range"
+                  min="2"
+                  max="25"
+                  step="1"
+                  value={bloom}
+                  onChange={(e) => setBloom(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Parameter 9: Constant Drip Rate */}
+              <div className="text-left flex flex-col gap-0.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold tracking-wider uppercase text-[9px]">9. Constant Drip Interval</span>
+                  <span className="font-mono font-bold text-[#5f8f73]">{autoInk === 0 ? 'Disabled' : `${autoInk}/sec`}</span>
+                </div>
+                <input
+                  id="input-auto-ink-slider"
+                  type="range"
+                  min="0"
+                  max="15"
+                  step="1"
+                  value={autoInk}
+                  onChange={(e) => setAutoInk(parseInt(e.target.value))}
+                  className="w-full accent-emerald-500 h-1 bg-black/15 rounded cursor-pointer mt-0.5"
+                />
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col gap-1.5 mt-2 pt-2 border-t border-[#5f8f73]/15">
+                <button
+                  id="btn-splatter-trigger"
+                  onClick={() => {
+                    // Throws splattered droplets!
+                    const numDrops = 8 + Math.floor(Math.random() * 6);
+                    const originX = 0.25 + Math.random() * 0.5;
+                    const originY = 0.25 + Math.random() * 0.5;
+                    const activeInk = INK_WELLS[selectedColorIdx];
+                    
+                    for (let i = 0; i < numDrops; i++) {
+                      const angle = Math.random() * Math.PI * 2.0;
+                      const dist = Math.pow(Math.random(), 1.5) * 0.16;
+                      const x = Math.max(0.05, Math.min(0.95, originX + Math.cos(angle) * dist));
+                      const y = Math.max(0.05, Math.min(0.95, originY + Math.sin(angle) * dist));
+                      const rad = brushWeight * (0.8 + Math.random() * 2.5) * (bloom / 10.0);
+                      const delay = Math.floor(Math.random() * 45);
+                      
+                      splashDropsQueueRef.current.push({
+                        x,
+                        y,
+                        devX: Math.max(0.0, Math.min(1.0, x + (Math.random() - 0.5) * 0.005)),
+                        devY: Math.max(0.0, Math.min(1.0, y + (Math.random() - 0.5) * 0.005)),
+                        color: activeInk.weightColor,
+                        rad,
+                        pressure: 0.6 + Math.random() * 1.5,
+                        delay
+                      });
+                    }
+                  }}
+                  className="w-full py-1.5 bg-emerald-950/60 hover:bg-emerald-900 border border-emerald-800/40 text-emerald-300 rounded-xl text-[8.5px] tracking-widest font-semibold uppercase transition duration-300 shadow flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                  <span>Splatter Active Pigment</span>
+                </button>
+
+                <button
+                  id="btn-restore-physics-defaults"
+                  onClick={() => {
+                    setSimResolution(384);
+                    setDyeResolution(1024);
+                    setDensity(30);
+                    setDissipation(35);
+                    setVelocity(40);
+                    setPressureIters(20);
+                    setCurl(11);
+                    setBloom(10);
+                    setAutoInk(0);
+                  }}
+                  className="w-full py-1 hover:bg-neutral-500/10 text-neutral-400 rounded-xl text-[8px] tracking-wider transition-colors uppercase font-medium cursor-pointer"
+                >
+                  Restore Ancient Form Defaults
+                </button>
+              </div>
+
+            </div>
+          </div>
+        )}
         <div className="absolute bottom-28 right-4 flex flex-col items-center gap-2 md:hidden">
           <button
             id="mobile-btn-wash"
